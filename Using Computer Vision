@@ -1,0 +1,201 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+from collections import deque
+
+class AdvancedPoseDetector:
+    def __init__(self):
+        self.mpDraw = mp.solutions.drawing_utils
+        self.mpPose = mp.solutions.pose
+        self.pose = self.mpPose.Pose(static_image_mode=False, model_complexity=2, smooth_landmarks=True,
+                                     min_detection_confidence=0.7, min_tracking_confidence=0.7)
+        
+        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.tracks = {}
+        self.track_id = 0
+        self.person_count = 0
+        self.action_history = deque(maxlen=45)  # Increased history for smoother action detection
+        
+    def findPose(self, img):
+        imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self.results = self.pose.process(imgRGB)
+        if self.results.pose_landmarks:
+            self.mpDraw.draw_landmarks(img, self.results.pose_landmarks, self.mpPose.POSE_CONNECTIONS,
+                                       self.mpDraw.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
+                                       self.mpDraw.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2))
+        return img
+
+    def getPosition(self, img):
+        lmList = []
+        if self.results.pose_landmarks:
+            for id, lm in enumerate(self.results.pose_landmarks.landmark):
+                h, w, c = img.shape
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                lmList.append([id, cx, cy])
+        return lmList
+
+    def track_persons(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        current_tracks = set()
+        
+        for (x, y, w, h) in faces:
+            matched = False
+            for track_id, track in self.tracks.items():
+                if abs(track['x'] - x) < w/2 and abs(track['y'] - y) < h/2:
+                    self.tracks[track_id] = {'x': x, 'y': y, 'w': w, 'h': h, 'ttl': 10}
+                    matched = True
+                    current_tracks.add(track_id)
+                    break
+            if not matched:
+                self.tracks[self.track_id] = {'x': x, 'y': y, 'w': w, 'h': h, 'ttl': 10}
+                current_tracks.add(self.track_id)
+                self.track_id += 1
+
+        for track_id in list(self.tracks.keys()):
+            if track_id not in current_tracks:
+                del self.tracks[track_id]
+
+        self.person_count = len(self.tracks)
+
+        for track_id, track in self.tracks.items():
+            cv2.rectangle(img, (track['x'], track['y']), (track['x'] + track['w'], track['y'] + track['h']), (0, 255, 0), 2)
+            cv2.putText(img, f"Person {track_id}", (track['x'], track['y'] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
+        
+        return img
+
+    def recognize_action(self, lmList):
+        if len(lmList) < 33:
+            return "No pose detected"
+
+        # Get relevant landmarks
+        left_wrist = lmList[15]
+        right_wrist = lmList[16]
+        left_elbow = lmList[13]
+        right_elbow = lmList[14]
+        left_shoulder = lmList[11]
+        right_shoulder = lmList[12]
+        left_hip = lmList[23]
+        right_hip = lmList[24]
+        left_knee = lmList[25]
+        right_knee = lmList[26]
+
+        # Check for actions
+        if left_wrist[2] < left_shoulder[2] and right_wrist[2] < right_shoulder[2]:
+            action = "Hands raised"
+        elif (left_wrist[2] < left_elbow[2] and left_elbow[2] < left_shoulder[2]) or \
+             (right_wrist[2] < right_elbow[2] and right_elbow[2] < right_shoulder[2]):
+            action = "Waving"
+        elif abs(left_wrist[1] - left_hip[1]) < 50 and abs(left_wrist[2] - left_hip[2]) < 50:
+            action = "Talking on phone"
+        elif abs(left_hip[2] - right_hip[2]) > 30 or abs(left_knee[2] - right_knee[2]) > 30:
+            action = "Walking or moving"
+        elif abs(left_shoulder[2] - right_shoulder[2]) > 30:
+            action = "Leaning or tilted posture"
+        else:
+            action = "Standing/Neutral pose"
+
+        self.action_history.append(action)
+        return max(set(self.action_history), key=self.action_history.count)  # Return most common action
+
+    def analyze_posture(self, lmList):
+        if len(lmList) >= 33:
+            left_shoulder = lmList[11]
+            right_shoulder = lmList[12]
+            left_hip = lmList[23]
+            right_hip = lmList[24]
+            
+            shoulder_slope = abs(left_shoulder[2] - right_shoulder[2]) / max(abs(left_shoulder[1] - right_shoulder[1]), 1)
+            hip_slope = abs(left_hip[2] - right_hip[2]) / max(abs(left_hip[1] - right_hip[1]), 1)
+            
+            mid_shoulder = [(left_shoulder[1] + right_shoulder[1]) // 2, (left_shoulder[2] + right_shoulder[2]) // 2]
+            mid_hip = [(left_hip[1] + right_hip[1]) // 2, (left_hip[2] + right_hip[2]) // 2]
+            
+            back_angle = np.arctan2(mid_shoulder[1] - mid_hip[1], mid_shoulder[0] - mid_hip[0]) * 180 / np.pi
+            
+            if shoulder_slope < 0.1 and hip_slope < 0.1 and 80 < back_angle < 100:
+                return "Excellent posture", "Great job maintaining a straight posture!"
+            elif shoulder_slope < 0.15 and hip_slope < 0.15 and 75 < back_angle < 105:
+                return "Good posture", "Try to keep your shoulders level and back straight."
+            elif shoulder_slope < 0.2 and hip_slope < 0.2 and 70 < back_angle < 110:
+                return "Fair posture", "Focus on aligning your shoulders and hips. Stand up straight!"
+            else:
+                return "Poor posture", "Straighten your back, level your shoulders and hips. Take breaks to stretch!"
+        return "Unable to analyze posture", "Ensure your full body is visible in the camera."
+
+def create_stylish_overlay(img, info):
+    overlay = img.copy()
+    height, width = img.shape[:2]
+    
+    # Create a gradient background for the overlay
+    gradient = np.linspace(0, 1, width).reshape(1, width, 1)
+    gradient = np.tile(gradient, (height, 1, 3))
+    gradient = (gradient * np.array([0, 0, 128])).astype(np.uint8)  # Dark blue gradient
+    
+    cv2.addWeighted(overlay, 0.7, gradient, 0.3, 0, overlay)
+    
+    # Add a sleek header
+    cv2.rectangle(overlay, (0, 0), (width, 60), (0, 0, 0), -1)
+    cv2.putText(overlay, "Advanced Pose and Action Detection", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    # Add info boxes
+    y_offset = 70
+    for key, value in info.items():
+        cv2.rectangle(overlay, (10, y_offset), (width - 10, y_offset + 40), (255, 255, 255, 150), -1)
+        cv2.putText(overlay, f"{key}: {value}", (20, y_offset + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        y_offset += 50
+    
+    return overlay
+
+def main():
+    cap = cv2.VideoCapture(0)
+    pTime = 0
+    detector = AdvancedPoseDetector()
+
+    while True:
+        success, img = cap.read()
+        if not success:
+            print("Failed to capture frame from camera. Check camera connection.")
+            break
+
+        img = detector.findPose(img)
+        img = detector.track_persons(img)
+        lmList = detector.getPosition(img)
+
+        action = "No action detected"
+        posture, posture_advice = "Unable to analyze posture", ""
+        if lmList:
+            action = detector.recognize_action(lmList)
+            posture, posture_advice = detector.analyze_posture(lmList)
+
+        cTime = time.time()
+        fps = 1 / (cTime - pTime)
+        pTime = cTime
+
+        info = {
+            "FPS": f"{int(fps)}",
+            "Person Count": f"{detector.person_count}",
+            "Action": action,
+            "Posture": posture,
+            "Advice": posture_advice
+        }
+
+        stylish_overlay = create_stylish_overlay(img, info)
+        
+        # Blend the stylish overlay with the original image
+        cv2.addWeighted(stylish_overlay, 0.3, img, 0.7, 0, img)
+
+        cv2.imshow("Advanced Pose and Action Detection", img)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main() 
